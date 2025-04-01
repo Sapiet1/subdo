@@ -1,15 +1,12 @@
 use std::{
     path::PathBuf,
-    pin,
     process::Output
 };
 
 use anyhow::{Context, Error};
-use futures::stream::StreamExt;
 use subdo::{Cli, CliParsed, ProcessError};
 
 use tokio::{
-    fs::ReadDir,
     io::{self, AsyncWriteExt, Stderr, Stdout},
     sync::{Mutex, MutexGuard}
 };
@@ -21,18 +18,18 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to parse CLI")?;
 
     #[cfg(feature = "json")]
-    match cli.mode {
-        subdo::json::Mode::Standard => (),
+    match cli.mode() {
         subdo::json::Mode::Json => return execute_json(&cli, entries, serde_json::to_string).await,
         subdo::json::Mode::JsonPretty => return execute_json(&cli, entries, serde_json::to_string_pretty).await,
+        subdo::json::Mode::Standard => (),
     }
 
     execute_standard(&cli, entries).await;
     Ok(())
 }
 
-async fn execute_standard(cli: &CliParsed, entries: ReadDir) {
-    let execute = async |
+async fn execute_standard(cli: &CliParsed, entries: PathBuf) {
+    let consume = async |
         processed: Result<(PathBuf, Output), ProcessError>,
         stdout: &mut MutexGuard<'_, Stdout>,
         stderr: &mut MutexGuard<'_, Stderr>,
@@ -57,42 +54,73 @@ async fn execute_standard(cli: &CliParsed, entries: ReadDir) {
         subdo::async_write!(as [u8] => stderr, &output.stderr);
     };
 
-    let stdout = &Mutex::new(io::stdout());
-    let stderr = &Mutex::new(io::stderr());
-
-    let mut processed_entries = pin::pin!(cli.process(entries));
-
-    if let Some(processed) = processed_entries.next().await {
+    let consumer = async |
+        processed: Result<(PathBuf, Output), ProcessError>,
+        stdout: &Mutex<Stdout>,
+        stderr: &Mutex<Stderr>,
+        first_write: &mut bool,
+    | {
         let mut stdout = stdout.lock().await;
         let mut stderr = stderr.lock().await;
 
-        execute(processed, &mut stdout, &mut stderr).await;
-
-        while let Some(processed) = processed_entries.next().await {
+        if !*first_write {
             subdo::async_write!(stdout, "\n");
-            execute(processed, &mut stdout, &mut stderr).await;
         }
-    }
 
-    subdo::async_write!(flush => stdout.lock().await);
-    subdo::async_write!(flush => stderr.lock().await);
+        consume(processed, &mut stdout, &mut stderr).await;
+        *first_write = false;
+    };
+
+    let finish = async |
+        stdout: &Mutex<Stdout>,
+        stderr: &Mutex<Stderr>,
+    | {
+        subdo::async_write!(flush => stdout.lock().await);
+        subdo::async_write!(flush => stderr.lock().await);
+    };
+
+    let mut first_write = true;
+    let stdout = &Mutex::new(io::stdout());
+    let stderr = &Mutex::new(io::stderr());
+
+    cli.process(entries, async |processed| {
+        consumer(processed, stdout, stderr, &mut first_write).await
+    })
+    .await;
+
+    finish(stdout, stderr).await;
 }
 
 #[cfg(feature = "json")]
 async fn execute_json<
     F: FnOnce(&subdo::json::ProcessedEntries) -> Result<String, serde_json::Error>,
->(cli: &CliParsed, entries: ReadDir, formatter: F) -> anyhow::Result<()>
+>(cli: &CliParsed, entries: PathBuf, formatter: F) -> anyhow::Result<()>
 {
-    let processed_entries = cli
-        .process(entries)
-        .collect::<subdo::json::ProcessedEntries>()
-        .await;
+    let consumer = async |
+        processed: Result<(PathBuf, Output), ProcessError>,
+        processed_entries: &mut subdo::json::ProcessedEntries,
+    | {
+        processed_entries.insert(processed);
+    };
 
-    let json = formatter(&processed_entries).context("Failed to JSONify outputs")?;
+    let finish = async |
+        processed_entries: &subdo::json::ProcessedEntries,
+    | {
+        let json = formatter(processed_entries).context("Failed to JSONify outputs")?;
 
-    let mut stdout = io::stdout();
-    subdo::async_write!(stdout, "{}\n", json);
-    subdo::async_write!(flush => stdout);
+        let mut stdout = io::stdout();
+        subdo::async_write!(stdout, "{}\n", json);
+        subdo::async_write!(flush => stdout);
 
-    Ok(())
+        Ok::<_, Error>(())
+    };
+
+    let mut processed_entries = subdo::json::ProcessedEntries::default();
+
+    cli.process(entries, async |processed| {
+        consumer(processed, &mut processed_entries).await;
+    })
+    .await;
+
+    finish(&processed_entries).await
 }

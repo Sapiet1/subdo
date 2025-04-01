@@ -4,21 +4,27 @@ pub mod json;
 #[macro_use]
 mod macros;
 
+#[cfg(feature = "regex")]
+pub mod pattern;
+
 use std::{
     collections::HashSet,
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
+    future,
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    pin,
     process::{Output, Stdio},
+    task::Poll,
 };
 
 use clap::{Parser, Subcommand};
-use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use futures::stream::{self, FuturesUnordered, Stream, StreamExt, TryStreamExt};
 use thiserror::Error;
 
 use tokio::{
-    fs::{self, DirEntry, ReadDir},
+    fs,
     process::Command,
     time::{self, Duration},
 };
@@ -29,13 +35,16 @@ use tokio_stream::wrappers::ReadDirStream;
 #[command(name = "subdo", version, about = "A CLI for applying a command to directories within a directory", long_about = None)]
 pub struct Cli {
     /// A path to specify for the parent directory
-    #[arg(long)]
+    #[arg(short, long)]
     path: Option<PathBuf>,
-    /// The paths of the children directories to ignore
-    #[arg(short, long, value_name = "PATH", value_delimiter = ' ', num_args = 1..)]
-    ignore: Vec<PathBuf>,
+    /// The patterns denoting which children directories to ignore
+    #[arg(short, long, value_name = "PATTERN", value_delimiter = ' ', num_args = 1..)]
+    ignore: Vec<OsString>,
+    /// Applies the command to the tree with the path as root
+    #[arg(short, long, default_value_t = false)]
+    recursive: bool,
     /// Max number of concurrent tasks
-    #[arg(short, long, default_value_t = num_cpus::get() as u16, value_parser = clap::value_parser!(u16).range(1..))]
+    #[arg(short, long, default_value_t = num_cpus::get().min(u16::MAX as usize) as u16, value_parser = clap::value_parser!(u16).range(1..))]
     jobs: u16,
     /// Max duration for any given process
     #[arg(short, long, value_parser = humantime::parse_duration)]
@@ -56,13 +65,26 @@ enum External {
 }
 
 pub struct CliParsed {
-    pub command: (OsString, Vec<OsString>),
-    pub directory: PathBuf,
-    pub ignored_subdirectories: HashSet<PathBuf>,
-    pub jobs: usize,
-    pub timeout: Option<Duration>,
+    command: (OsString, Vec<OsString>),
+    ignored_subdirectories: IgnoredEntries,
+    recursive: bool,
+    jobs: usize,
+    timeout: Option<Duration>,
     #[cfg(feature = "json")]
-    pub mode: json::Mode,
+    mode: json::Mode,
+}
+
+#[derive(Default)]
+struct IgnoredEntries {
+    exact: HashSet<PathBuf>,
+    #[cfg(feature = "regex")]
+    pattern: pattern::IgnoredPattern,
+}
+
+pub enum IgnoredEntry {
+    Exact(PathBuf),
+    #[cfg(feature = "regex")]
+    Pattern(regex::Regex),
 }
 
 #[derive(Debug, Error)]
@@ -71,16 +93,19 @@ pub enum CliError {
     Command,
     #[error("current directory is unavailable as: {0}")]
     CurrentDirectory(io::Error),
-    #[error("subdirectories are unavailable as: {0}")]
-    SubDirectories(io::Error),
     #[error("an ignored directory ({entry}) is invalid as: {origin}", entry = .0.display(), origin = .1)]
     IgnoredDirectories(PathBuf, io::Error),
+    #[cfg(feature = "regex")]
+    #[error("ignored pattern is unavailable as: {0}")]
+    IgnoredPattern(#[from] pattern::PatternError),
 }
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
     #[error("invalid directory entry from likely modification")]
     ModifiedEntry,
+    #[error("subdirectories for {entry} are unavailable as: {origin}", .entry = .entry.display())]
+    SubDirectories { entry: PathBuf, origin: io::Error },
     #[error("process {process} for {entry} made unavailable as: {origin}", process = .process.to_string_lossy(), entry = .entry.display())]
     ProcessSpawn { process: OsString, entry: PathBuf, origin: io::Error },
     #[error("process {process} for {entry} has unavailable output as: {origin}", process = .process.to_string_lossy(), entry = .entry.display())]
@@ -90,13 +115,14 @@ pub enum ProcessError {
 }
 
 impl Cli {
-    pub async fn parse() -> Result<(ReadDir, CliParsed), CliError> {
+    pub async fn parse() -> Result<(PathBuf, CliParsed), CliError> {
         let cli: Cli = Parser::parse();
 
         #[cfg(feature = "json")]
         let mode = cli.mode;
-        let jobs = usize::from(cli.jobs);
         let timeout = cli.timeout;
+        let jobs = usize::from(cli.jobs);
+        let recursive = cli.recursive;
 
         let External::Command(command) = cli.command;
         let mut command = command.into_iter();
@@ -112,12 +138,15 @@ impl Cli {
             .unwrap_or_else(env::current_dir)
             .map_err(CliError::CurrentDirectory)?;
 
-        let entries = fs::read_dir(&directory)
-            .await
-            .map_err(CliError::SubDirectories)?;
-
         let ignored_subdirectories = stream::iter(cli.ignore.into_iter())
-            .map(|mut path| async {
+            .map(|ignored_entry| async {
+                #[cfg(feature = "regex")]
+                if let Some(pattern) = IgnoredEntry::pattern(&ignored_entry).await {
+                    return Ok(pattern?);
+                }
+
+                let mut path = PathBuf::from(ignored_entry);
+
                 if path.is_relative() {
                     let mut ignored_directory = directory.clone();
                     ignored_directory.push(path);
@@ -126,16 +155,18 @@ impl Cli {
 
                 fs::canonicalize(&path)
                     .await
+                    .map(IgnoredEntry::Exact)
                     .map_err(|error| CliError::IgnoredDirectories(path, error))
             })
             .buffer_unordered(jobs)
-            .try_collect::<HashSet<_>>()
-            .await?;
+            .try_collect::<IgnoredEntries>()
+            .await?
+            .finish();
 
-        Ok((entries, CliParsed {
+        Ok((directory, CliParsed {
             command,
-            directory,
             ignored_subdirectories,
+            recursive,
             jobs,
             timeout,
             #[cfg(feature = "json")]
@@ -145,63 +176,229 @@ impl Cli {
 }
 
 impl CliParsed {
-    pub fn process(&self, entries: ReadDir) -> impl Stream<Item = Result<(PathBuf, Output), ProcessError>> + use<'_> {
-        ReadDirStream::new(entries)
-            .map(|entry| self.process_initial(entry))
-            .buffer_unordered(self.jobs)
-            .filter_map(|processed| async { processed })
+    #[cfg(feature = "json")]
+    pub fn mode(&self) -> json::Mode {
+        self.mode
     }
 
-    async fn process_initial(&self, entry: Result<DirEntry, io::Error>) -> Option<Result<(PathBuf, Output), ProcessError>> {
-        let (entry_canonicalized, entry) = match entry.as_ref().map(DirEntry::path) {
-            Ok(entry) => match fs::canonicalize(&entry).await {
-                Ok(entry_canonicalized) => (entry_canonicalized, entry),
-                Err(_) => return Some(Err(ProcessError::ModifiedEntry)),
+    pub async fn process(&self,
+        root: PathBuf,
+        consumer: impl AsyncFnMut(Result<(PathBuf, Output), ProcessError>),
+    ) {
+        if self.recursive {
+            self.process_recursive(root, consumer).await;
+        } else {
+            self.process_standard(root, consumer).await;
+        }
+    }
+
+    async fn process_standard(
+        &self,
+        root: PathBuf,
+        mut consumer: impl AsyncFnMut(Result<(PathBuf, Output), ProcessError>),
+    ) {
+        let directory = match CliParsed::process_directory(&root, &self.ignored_subdirectories).await {
+            Ok(root_directory) => root_directory,
+            Err(error) => {
+                consumer(Err(error)).await;
+                return;
             },
-            Err(_) => return Some(Err(ProcessError::ModifiedEntry)),
         };
 
-        if !entry.is_dir()
-        || self.ignored_subdirectories.contains(&entry_canonicalized)
-        {
-            return None;
+        let outputs = directory
+            .map(|entry| async { CliParsed::process_output(entry?, &self.command.0, &self.command.1, self.timeout).await })
+            .buffer_unordered(self.jobs);
+
+        let mut outputs = pin::pin!(outputs);
+
+        while let Some(yielded) = outputs.next().await {
+            consumer(yielded).await;
+        }
+    }
+
+    async fn process_recursive(
+        &self,
+        root: PathBuf,
+        mut consumer: impl AsyncFnMut(Result<(PathBuf, Output), ProcessError>),
+    ) {
+        let root_directory = match CliParsed::process_directory(&root, &self.ignored_subdirectories).await {
+            Ok(root_directory) => root_directory,
+            Err(error) => {
+                consumer(Err(error)).await;
+                return;
+            },
+        };
+
+        let mut directories = Vec::from([Box::pin(root_directory)]);
+        let mut outputs = FuturesUnordered::new();
+
+        let root_output = CliParsed::process_output(root, &self.command.0, &self.command.1, self.timeout);
+        outputs.push(root_output);
+
+        while let Some(current_directory) = directories.last_mut() {
+            let entry = match current_directory.next().await {
+                Some(Ok(entry)) => entry,
+                Some(Err(error)) => {
+                    consumer(Err(error)).await;
+                    continue;
+                },
+                None => {
+                    directories.pop();
+                    continue;
+                },
+            };
+
+            directories.push(match CliParsed::process_directory(&entry, &self.ignored_subdirectories).await {
+                Ok(subdirectory) => Box::pin(subdirectory),
+                Err(error) => {
+                    consumer(Err(error)).await;
+                    continue;
+                },
+            });
+
+            if outputs.len() >= self.jobs {
+                let yielded = outputs
+                    .next()
+                    .await
+                    .unwrap();
+
+                consumer(yielded).await;
+
+                while let Some(yielded) = future::poll_fn(|ctx| match outputs.poll_next_unpin(ctx) {
+                    Poll::Ready(Some(yielded)) => Poll::Ready(Some(yielded)),
+                    _ => Poll::Ready(None),
+                }).await {
+                    consumer(yielded).await;
+                }
+            }
+
+            outputs.push(CliParsed::process_output(entry, &self.command.0, &self.command.1, self.timeout));
         }
 
-        let child = match Command::new(&self.command.0)
-            .current_dir(&entry)
+        while let Some(yielded) = outputs.next().await {
+            consumer(yielded).await;
+        }
+    }
+
+    async fn process_directory<'a>(path: &Path, ignored: &'a IgnoredEntries) -> Result<impl Stream<Item = Result<PathBuf, ProcessError>> + use<'a>, ProcessError> {
+        let directory = match fs::read_dir(path).await {
+            Ok(directory) => directory,
+            Err(error) => return Err(ProcessError::SubDirectories {
+                entry: path.to_owned(),
+                origin: error,
+            }),
+        };
+
+        let directory = ReadDirStream::new(directory)
+            .filter_map(|entry| async {
+                let Ok(entry) = entry else {
+                    return Some(Err(ProcessError::ModifiedEntry));
+                };
+
+                let Ok(metadata) = entry.metadata().await else {
+                    return Some(Err(ProcessError::ModifiedEntry));
+                };
+
+                let path = entry.path();
+
+                match (metadata.is_dir(), ignored.as_valid(&path).await) {
+                    (false, _) | (_, Ok(None)) => None,
+                    (true, Err(error)) => Some(Err(error)),
+                    (true, Ok(Some(path_canonicalized))) => Some(Ok(path_canonicalized)),
+                }
+            });
+
+        Ok(directory)
+    }
+
+    async fn process_output(path: PathBuf, command: &OsStr, args: impl IntoIterator<Item = impl AsRef<OsStr>>, timeout: Option<Duration>) -> Result<(PathBuf, Output), ProcessError> {
+        let child = match Command::new(command)
+            .current_dir(&path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
-            .args(&self.command.1)
+            .args(args)
             .spawn()
         {
             Ok(child) => child,
-            Err(error) => return Some(Err(ProcessError::ProcessSpawn {
-                process: self.command.0.clone(),
-                entry,
+            Err(error) => return Err(ProcessError::ProcessSpawn {
+                process: command.to_owned(),
+                entry: path,
                 origin: error,
-            })),
+            }),
         };
 
-        let output = match self.timeout {
+        let output = match timeout {
             Some(duration) => match time::timeout(duration, child.wait_with_output()).await {
                 Ok(output) => output,
-                Err(_) => return Some(Err(ProcessError::Timeout {
-                    process: self.command.0.clone(),
-                    entry,
+                Err(_) => return Err(ProcessError::Timeout {
+                    process: command.to_owned(),
+                    entry: path,
                     duration: humantime::format_duration(duration).to_string(),
-                })),
+                }),
             },
             None => child.wait_with_output().await,
         };
 
         match output {
-            Ok(output) => Some(Ok((entry, output))),
-            Err(error) => Some(Err(ProcessError::ProcessOutput {
-                process: self.command.0.clone(),
-                entry,
+            Ok(output) => Ok((path, output)),
+            Err(error) => Err(ProcessError::ProcessOutput {
+                process: command.to_owned(),
+                entry: path,
                 origin: error,
-            })),
+            }),
+        }
+    }
+}
+
+impl IgnoredEntries {
+    fn insert(&mut self, entry: IgnoredEntry) {
+        match entry {
+            #[cfg(feature = "regex")]
+            IgnoredEntry::Pattern(pattern) => self.pattern.push(pattern),
+            IgnoredEntry::Exact(path) => {
+                self.exact.insert(path);
+            },
+        };
+    }
+
+    fn finish(self) -> IgnoredEntries {
+        IgnoredEntries {
+            exact: self.exact,
+            #[cfg(feature = "regex")]
+            pattern: self.pattern.compiled(),
+        }
+    }
+
+    async fn as_valid(&self, path: &Path) -> Result<Option<PathBuf>, ProcessError> {
+        let path = fs::canonicalize(path)
+            .await
+            .map_err(|_| ProcessError::ModifiedEntry)?;
+
+        if self.exact.contains(&path) {
+            return Ok(None);
+        }
+
+        #[cfg(feature = "regex")]
+        {
+            let file_name = path
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
+
+            if self.pattern.is_match(file_name.as_ref()) {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(path))
+    }
+}
+
+impl Extend<IgnoredEntry> for IgnoredEntries {
+    fn extend<T: IntoIterator<Item = IgnoredEntry>>(&mut self, iter: T) {
+        for entry in iter {
+            self.insert(entry);
         }
     }
 }

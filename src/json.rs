@@ -34,6 +34,7 @@ pub enum ProcessedError {
     Spawn { process: String, code: Option<i32>, description: String },
     Output { process: String, code: Option<i32>, description: String },
     Timeout { process: String, duration: String },
+    SubDirectories { code: Option<i32>, description: String }
 }
 
 impl ProcessedEntries {
@@ -64,6 +65,12 @@ impl ProcessedEntries {
                 self.processed.insert(entry, ProcessedEntry::Error(ProcessedError::Timeout {
                     process: process.to_string_lossy().into_owned(),
                     duration,
+                }));
+            },
+            Err(ProcessError::SubDirectories { entry, origin }) => {
+                self.processed.insert(entry, ProcessedEntry::Error(ProcessedError::SubDirectories {
+                    code: origin.raw_os_error(),
+                    description: origin.to_string(),
                 }));
             },
         }

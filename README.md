@@ -18,7 +18,7 @@ git clone https://github.com/Sapiet1/subdo.git
 cd subdo
 
 # Install the utility
-cargo install --path . --features json
+cargo install --path . --features all
 ```
 
 ### Running `subdo`
@@ -31,13 +31,13 @@ A CLI for applying a command to directories within a directory
 Usage: subdo [OPTIONS] <COMMAND>
 
 Options:
-      --path <PATH>        A path to specify for the parent directory
-  -i, --ignore <PATH>...   The paths of the children directories to ignore
-  -j, --jobs <JOBS>        Max number of concurrent tasks [default: 12]
-  -t, --timeout <TIMEOUT>  Max duration for any given process
-  -m, --mode <MODE>        Optional JSON representation [default: standard] [possible values: json, json-pretty, standard]
-  -h, --help               Print help
-  -V, --version            Print version
+      --path <PATH>          A path to specify for the parent directory
+  -i, --ignore <PATTERN>...  The patterns denoting which children directories to ignore
+  -j, --jobs <JOBS>          Max number of concurrent tasks [default: 12]
+  -t, --timeout <TIMEOUT>    Max duration for any given process
+  -m, --mode <MODE>          Optional JSON representation [default: standard] [possible values: json, json-pretty, standard]
+  -h, --help                 Print help
+  -V, --version              Print version
 ```
 
 Take note that `COMMAND` should always be listed after the flags. Also, `COMMAND` cannot be a shell command on linux, and therefore `cd`, `echo`, etc. will not run as expected. In that case, run, for example, `subdo sh -c 'ls -l'`.
